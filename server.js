@@ -1,286 +1,321 @@
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const bcrypt = require('bcryptjs');
-const bodyParser = require('body-parser');
 const cors = require('cors');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(bodyParser.json({
-    limit: '10mb',
-    verify: (req, res, buf) => {
-        console.log('Raw body received:', buf.toString());
-    }
-}));
+app.use(express.json({ limit: '10mb' }));  // Ganti body-parser ke built-in Express untuk efisiensi
 
-// Middleware timeout
+// Middleware timeout (kurangi untuk menghindari batas Vercel 10 detik)
 app.use((req, res, next) => {
-    res.setTimeout(10000, () => {
+    res.setTimeout(8000, () => {
         console.log('Request timeout for:', req.url);
         res.status(504).json({ error: 'Gateway Timeout' });
     });
     next();
 });
 
-// Inisialisasi DB
+// Inisialisasi DB dengan async
 const db = new sqlite3.Database('./accounts.db', (err) => {
-    if (err) console.error('DB error:', err.message);
+    if (err) {
+        console.error('DB error:', err.message);
+        process.exit(1);
+    }
     console.log('Connected to SQLite.');
 });
 
-// tabel akun!
-db.run(`CREATE TABLE IF NOT EXISTS accounts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    password TEXT NOT NULL,
-    role TEXT NOT NULL,
-    delet BOOLEAN DEFAULT 0,
-    active BOOLEAN DEFAULT 1 
-)`);
-
-db.run(`CREATE TABLE IF NOT EXISTS prestasi (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
-    description TEXT NOT NULL
-)`);
-db.run(`CREATE TABLE IF NOT EXISTS karya (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
-    description TEXT NOT NULL
-)`);
-
-// Inisialisasi akun default
-function initializeDefaultAccounts() {
-    const defaultAccounts = [
-        { username: "affan", password: "affaneka1412", role: "admin" },
-        { username: "mod", password: "mod123", role: "moderator" }
-    ];
-    db.get('SELECT COUNT(*) AS count FROM accounts', [], (err, row) => {
-        if (err) console.error('Count error:', err.message);
-        if (row.count === 0) {
-            defaultAccounts.forEach(account => {
-                const hashedPassword = bcrypt.hashSync(account.password, 10);
-                db.run('INSERT INTO accounts (username, password, role, delet, active) VALUES (?, ?, ?, 0, 1)',
-                    [account.username, hashedPassword, account.role], (err) => {
-                        if (err) console.error('Insert error:', err.message);
-                    });
-            });
-            console.log('Default accounts inserted.');
-        }
+// Helper untuk query async (efisien, non-blocking)
+const dbGet = (query, params = []) => {
+    return new Promise((resolve, reject) => {
+        db.get(query, params, (err, row) => {
+            if (err) reject(err);
+            else resolve(row);
+        });
     });
-}
-initializeDefaultAccounts();
+};
 
-function initializeDefaultAccounts() {
-    db.get('SELECT COUNT(*) AS count FROM accounts', [], (err, row) => {
-        if (err) {
-            console.error('Count query error:', err.message);
-            // Fallback: Buat tabel jika tidak ada
-            db.run(`CREATE TABLE accounts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                password TEXT NOT NULL,
-                role TEXT NOT NULL,
-                delet BOOLEAN DEFAULT 0,
-                active BOOLEAN DEFAULT 1
-            )`, (err) => {
-                if (err) console.error('Create table error:', err);
-                else {
-                    console.log('Table created.');
-                    // Insert default setelah create
-                    const defaultAccounts = [
-                        { username: "affan", password: "affaneka1412", role: "admin" },
-                        { username: "mod", password: "mod123", role: "moderator" }
-                    ];
-                    defaultAccounts.forEach(account => {
-                        const hashedPassword = bcrypt.hashSync(account.password, 10);
-                        db.run('INSERT INTO accounts (username, password, role, delet, active) VALUES (?, ?, ?, 0, 1)',
-                            [account.username, hashedPassword, account.role], (err) => {
-                                if (err) console.error('Insert error:', err.message);
-                            });
-                    });
-                    console.log('Default accounts inserted.');
-                }
-            });
-            return;
-        }
+const dbAll = (query, params = []) => {
+    return new Promise((resolve, reject) => {
+        db.all(query, params, (err, rows) => {
+            if (err) reject(err);
+            else resolve(rows);
+        });
+    });
+};
+
+const dbRun = (query, params = []) => {
+    return new Promise((resolve, reject) => {
+        db.run(query, params, function(err) {
+            if (err) reject(err);
+            else resolve({ id: this.lastID, changes: this.changes });
+        });
+    });
+};
+
+// Buat tabel jika belum ada (async)
+const initializeTables = async () => {
+    try {
+        await dbRun(`CREATE TABLE IF NOT EXISTS accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            role TEXT NOT NULL,
+            delet BOOLEAN DEFAULT 0,
+            active BOOLEAN DEFAULT 1
+        )`);
+        await dbRun(`CREATE TABLE IF NOT EXISTS prestasi (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL
+        )`);
+        await dbRun(`CREATE TABLE IF NOT EXISTS karya (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL
+        )`);
+        console.log('Tables initialized.');
+    } catch (err) {
+        console.error('Table init error:', err);
+    }
+};
+
+// Inisialisasi akun default (async, tanpa duplicate, dengan cache)
+let defaultAccountsCached = null;  // Cache untuk efisiensi
+const initializeDefaultAccounts = async () => {
+    try {
+        const row = await dbGet('SELECT COUNT(*) AS count FROM accounts');
         if (row.count === 0) {
             const defaultAccounts = [
-                { username: "affan", password: "affaneka1412", role: "admin" },
-                { username: "mod", password: "mod123", role: "moderator" }
+                { username: "affan", password: bcrypt.hashSync("affaneka1412", 10), role: "admin" },
+                { username: "mod", password: bcrypt.hashSync("mod123", 10), role: "moderator" }
             ];
-            defaultAccounts.forEach(account => {
-                const hashedPassword = bcrypt.hashSync(account.password, 10);
-                db.run('INSERT INTO accounts (username, password, role, delet, active) VALUES (?, ?, ?, 0, 1)',
-                    [account.username, hashedPassword, account.role], (err) => {
-                        if (err) console.error('Insert error:', err.message);
-                    });
-            });
+            for (const account of defaultAccounts) {
+                await dbRun('INSERT INTO accounts (username, password, role, delet, active) VALUES (?, ?, ?, 0, 1)',
+                    [account.username, account.password, account.role]);
+            }
             console.log('Default accounts inserted.');
+            defaultAccountsCached = defaultAccounts;  // Cache
         }
-    });
-}
+    } catch (err) {
+        console.error('Init accounts error:', err);
+    }
+};
 
-// Endpoint login
-app.post('/login', (req, res) => {
-    console.log('Login attempt:', req.body);
+// Jalankan inisialisasi
+(async () => {
+    await initializeTables();
+    await initializeDefaultAccounts();
+})();
+
+// Endpoint login (async, cepat)
+app.post('/login', async (req, res) => {
     const { username, password } = req.body;
     if (!username || !password) {
         return res.status(400).json({ success: false, message: 'Username dan password harus diisi!' });
     }
-    db.get('SELECT * FROM accounts WHERE username = ? AND delet = 0', [username], (err, row) => {
-        if (err) return res.status(500).json({ success: false, message: 'Server error' });
+    try {
+        const row = await dbGet('SELECT * FROM accounts WHERE username = ? AND delet = 0', [username]);
         if (row && bcrypt.compareSync(password, row.password)) {
-            console.log('Login success for:', username);
             res.json({ success: true, role: row.role, message: 'Login berhasil!' });
         } else {
             res.json({ success: false, message: 'Username atau password salah.' });
         }
-    });
+    } catch (err) {
+        console.error('Login error:', err);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
 });
 
-// Endpoint register
-app.post('/register', (req, res) => {
+// Endpoint register (async)
+app.post('/register', async (req, res) => {
     const { username, password, role } = req.body;
     if (!username || !password || !role) {
         return res.status(400).json({ success: false, message: 'Semua field harus diisi!' });
     }
-    const hashedPassword = bcrypt.hashSync(password, 10);
-    db.run('INSERT INTO accounts (username, password, role, delet, active) VALUES (?, ?, ?, 0, 1)',
-        [username, hashedPassword, role], function(err) {
-            if (err) {
-                console.error('Register error:', err.message);
-                return res.status(500).json({ success: false, message: 'Username sudah ada atau error server' });
-            }
-            res.json({ success: true, message: 'Akun berhasil dibuat!' });
-        });
+    try {
+        const hashedPassword = bcrypt.hashSync(password, 10);
+        await dbRun('INSERT INTO accounts (username, password, role, delet, active) VALUES (?, ?, ?, 0, 1)',
+            [username, hashedPassword, role]);
+        res.json({ success: true, message: 'Akun berhasil dibuat!' });
+    } catch (err) {
+        console.error('Register error:', err);
+        res.status(500).json({ success: false, message: 'Username sudah ada atau error server' });
+    }
 });
 
-// Endpoint list akun
-app.get('/accounts', (req, res) => {
-    db.all('SELECT username, role, active FROM accounts WHERE delet = 0', [], (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
+// Endpoint list akun (async, dengan cache jika memungkinkan)
+app.get('/accounts', async (req, res) => {
+    try {
+        const rows = await dbAll('SELECT username, role, active FROM accounts WHERE delet = 0');
         res.json(rows);
-    });
+    } catch (err) {
+        console.error('Accounts error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
-// Endpoint detail akun (untuk edit)
-app.get('/accounts/:username', (req, res) => {
+// Endpoint detail akun (async)
+app.get('/accounts/:username', async (req, res) => {
     const { username } = req.params;
-    db.get('SELECT username, role, active FROM accounts WHERE username = ? AND delet = 0', [username], (err, row) => {
-        if (err) return res.status(500).json({ error: err.message });
+    try {
+        const row = await dbGet('SELECT username, role, active FROM accounts WHERE username = ? AND delet = 0', [username]);
         if (!row) return res.status(404).json({ error: 'Akun tidak ditemukan' });
         res.json(row);
-    });
+    } catch (err) {
+        console.error('Account detail error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
-// Endpoint update akun
-app.put('/accounts/:username', (req, res) => {
+// Endpoint update akun (async)
+app.put('/accounts/:username', async (req, res) => {
     const { username } = req.params;
     const { password, role, active } = req.body;
-    const hashedPassword = password ? bcrypt.hashSync(password, 10) : null;
-    const query = hashedPassword ?
-        'UPDATE accounts SET password = ?, role = ?, active = ? WHERE username = ? AND delet = 0' :
-        'UPDATE accounts SET role = ?, active = ? WHERE username = ? AND delet = 0';
-    const params = hashedPassword ? [hashedPassword, role, active, username] : [role, active, username];
-    db.run(query, params, function(err) {
-        if (err) return res.status(500).json({ error: err.message });
+    try {
+        const hashedPassword = password ? bcrypt.hashSync(password, 10) : null;
+        const query = hashedPassword ?
+            'UPDATE accounts SET password = ?, role = ?, active = ? WHERE username = ? AND delet = 0' :
+            'UPDATE accounts SET role = ?, active = ? WHERE username = ? AND delet = 0';
+        const params = hashedPassword ? [hashedPassword, role, active, username] : [role, active, username];
+        await dbRun(query, params);
         res.json({ success: true, message: 'Akun berhasil diupdate!' });
-    });
+    } catch (err) {
+        console.error('Update account error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
-// Endpoint delete akun
-app.delete('/accounts/:username', (req, res) => {
+// Endpoint delete akun (async)
+app.delete('/accounts/:username', async (req, res) => {
     const { username } = req.params;
-    db.run('UPDATE accounts SET delet = 1 WHERE username = ? AND delet = 0', [username], function(err) {
-        if (err) return res.status(500).json({ error: err.message });
+    try {
+        await dbRun('UPDATE accounts SET delet = 1 WHERE username = ? AND delet = 0', [username]);
         res.json({ success: true, message: 'Akun berhasil dihapus!' });
-    });
+    } catch (err) {
+        console.error('Delete account error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
-// Endpoint CRUD prestasi
-app.get('/prestasi', (req, res) => {
-    db.all('SELECT * FROM prestasi', [], (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
+// Endpoint CRUD prestasi (async)
+app.get('/prestasi', async (req, res) => {
+    try {
+        const rows = await dbAll('SELECT * FROM prestasi');
         res.json(rows);
-    });
+    } catch (err) {
+        console.error('Prestasi error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
-app.get('/prestasi/:id', (req, res) => {
+app.get('/prestasi/:id', async (req, res) => {
     const { id } = req.params;
-    db.get('SELECT * FROM prestasi WHERE id = ?', [id], (err, row) => {
-        if (err) return res.status(500).json({ error: err.message });
+    try {
+        const row = await dbGet('SELECT * FROM prestasi WHERE id = ?', [id]);
         res.json(row);
-    });
+    } catch (err) {
+        console.error('Prestasi detail error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
-app.post('/prestasi', (req, res) => {
+app.post('/prestasi', async (req, res) => {
     const { title, description } = req.body;
-    db.run('INSERT INTO prestasi (title, description) VALUES (?, ?)', [title, description], function(err) {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json({ success: true, id: this.lastID });
-    });
+    try {
+        const result = await dbRun('INSERT INTO prestasi (title, description) VALUES (?, ?)', [title, description]);
+        res.json({ success: true, id: result.id });
+    } catch (err) {
+        console.error('Add prestasi error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
-app.put('/prestasi/:id', (req, res) => {
+app.put('/prestasi/:id', async (req, res) => {
     const { id } = req.params;
     const { title, description } = req.body;
-    db.run('UPDATE prestasi SET title = ?, description = ? WHERE id = ?', [title, description, id], function(err) {
-        if (err) return res.status(500).json({ error: err.message });
+    try {
+        await dbRun('UPDATE prestasi SET title = ?, description = ? WHERE id = ?', [title, description, id]);
         res.json({ success: true });
-    });
+    } catch (err) {
+        console.error('Update prestasi error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
-app.delete('/prestasi/:id', (req, res) => {
+app.delete('/prestasi/:id', async (req, res) => {
     const { id } = req.params;
-    db.run('DELETE FROM prestasi WHERE id = ?', [id], function(err) {
-        if (err) return res.status(500).json({ error: err.message });
+    try {
+        await dbRun('DELETE FROM prestasi WHERE id = ?', [id]);
         res.json({ success: true });
-    });
+    } catch (err) {
+        console.error('Delete prestasi error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
-// Endpoint CRUD karya (mirip prestasi)
-app.get('/karya', (req, res) => {
-    db.all('SELECT * FROM karya', [], (err, rows) => {
-        if (err) return res.status(500).json({ error: err.message });
+// Endpoint CRUD karya (mirip prestasi, async)
+app.get('/karya', async (req, res) => {
+    try {
+        const rows = await dbAll('SELECT * FROM karya');
         res.json(rows);
-    });
+    } catch (err) {
+        console.error('Karya error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
-app.get('/karya/:id', (req, res) => {
+app.get('/karya/:id', async (req, res) => {
     const { id } = req.params;
-    db.get('SELECT * FROM karya WHERE id = ?', [id], (err, row) => {
-        if (err) return res.status(500).json({ error: err.message });
+    try {
+        const row = await dbGet('SELECT * FROM karya WHERE id = ?', [id]);
         res.json(row);
-    });
+    } catch (err) {
+        console.error('Karya detail error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
-app.post('/karya', (req, res) => {
+app.post('/karya', async (req, res) => {
     const { title, description } = req.body;
-    db.run('INSERT INTO karya (title, description) VALUES (?, ?)', [title, description], function(err) {
-        if (err) return res.status(500).json({ error: err.message });
-        res.json({ success: true, id: this.lastID });
-    });
+    try {
+        const result = await dbRun('INSERT INTO karya (title, description) VALUES (?, ?)', [title, description]);
+        res.json({ success: true, id: result.id });
+    } catch (err) {
+        console.error('Add karya error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
-app.put('/karya/:id', (req, res) => {
+app.put('/karya/:id', async (req, res) => {
     const { id } = req.params;
     const { title, description } = req.body;
-    db.run('UPDATE karya SET title = ?, description = ? WHERE id = ?', [title, description, id], function(err) {
-        if (err) return res.status(500).json({ error: err.message });
+    try {
+        await dbRun('UPDATE karya SET title = ?, description = ? WHERE id = ?', [title, description, id]);
         res.json({ success: true });
-    });
+    } catch (err) {
+        console.error('Update karya error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
-app.delete('/karya/:id', (req, res) => {
+app.delete('/karya/:id', async (req, res) => {
     const { id } = req.params;
-    db.run('DELETE FROM karya WHERE id = ?', [id], function(err) {
-        if (err) return res.status(500).json({ error: err.message });
+    try {
+        await dbRun('DELETE FROM karya WHERE id = ?', [id]);
         res.json({ success: true });
-    });
+    } catch (err) {
+        console.error('Delete karya error:', err);
+        res.status(500).json({ error: err.message });
+    }
 });
 
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-});
+module.exports = app;  // Untuk Vercel serverless
 
-process.on('SIGINT', () => {
-    db.close((err) => {
-        if (err) console.error('DB close error:', err.message);
-        process.exit(0);
+// Jika run lokal
+if (require.main === module) {
+    app.listen(PORT, () => {
+        console.log(`Server running on port ${PORT}`);
     });
-});
+
+    process.on('SIGINT', () => {
+        db.close((err) => {
+            if (err) console.error('DB close error:', err.message);
+            process.exit(0);
+        });
+    });
+}
